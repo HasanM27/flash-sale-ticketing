@@ -1,0 +1,266 @@
+# Flash Sale Ticketing System — Build Plan
+
+A distributed system that protects your database from a thundering herd of buy requests during a limited-inventory flash sale, by putting Kafka between a bursty, autoscaling API and a small, steady-paced worker that's the *only* thing allowed to touch inventory.
+
+Your original architecture is solid — this doc keeps it intact and adds the handful of pieces (a feedback loop, idempotency, atomic writes, a real load test) needed to make the core claim — *the database stays stable while the API scales* — actually true, and actually provable.
+
+## Table of Contents
+1. [What Changed From Your Original Idea](#1-what-changed-from-your-original-idea)
+2. [Architecture](#2-architecture)
+3. [Tech Stack](#3-tech-stack)
+4. [Repository Structure](#4-repository-structure)
+5. [Key Design Decisions](#5-key-design-decisions)
+6. [Build Order](#6-build-order)
+7. [Success Criteria](#7-success-criteria)
+8. [Stretch Goals](#8-stretch-goals)
+
+---
+
+## 1. What Changed From Your Original Idea
+
+- **Order API never writes to Postgres.** Only publishes to Kafka and does read-only status lookups. If it wrote a row per request, DB load would scale with API pods again — undermining the whole point of the design. Only the Inventory Worker writes.
+- **Added an order-status endpoint.** `GET /orders/{order_id}` — your original design returns "Processing" but never says how a user finds out if they actually got a ticket.
+- **Idempotent worker writes.** Kafka is *at-least-once*, not exactly-once. A consumer restart or rebalance can redeliver a message. Without an idempotency check, that means double-decrementing inventory.
+- **Atomic inventory deduction.** One conditional `UPDATE` instead of a read-then-write. Kafka partitioning already prevents most races, but this is a cheap, correct safety net.
+- **Kafka partitioned by `event_id`.** This is what actually gives you the concurrency guarantee — the same event always lands on the same partition and is processed in order by one consumer, while different events process in parallel. Worth understanding well; it's the core of why this design is correct.
+- **Inventory Worker is NOT autoscaled.** Small, fixed replica count. That fixed slowness is what protects Postgres — scaling it defeats the purpose.
+- **Added a load-testing phase.** The project's central claim is a performance claim. Without firing real concurrent traffic and watching the metrics, you have an architecture that *should* work, not one you've *shown* works.
+
+---
+
+## 2. Architecture
+
+```
+Client ──1. POST /orders──▶ Order API (FastAPI)
+                                  │
+                                  ├── HPA scales this service 2 → 20 pods under load
+                                  │
+                                  ├──2. returns 202 {order_id, "PENDING"} immediately
+                                  │      (no DB write happens here)
+                                  │
+                                  └──3. publishes to Kafka topic "order-requests"
+                                        (key = event_id, 6 partitions)
+                                                 │
+                                                 │ 4. consumed at a steady,
+                                                 │    deliberately fixed pace
+                                                 ▼
+                                     Inventory Worker (fixed 2–3 pods, never autoscaled)
+                                                 │
+                                                 ├── 5. idempotency check on order_id
+                                                 ├── 6. atomic conditional UPDATE
+                                                 │      (decrement available_tickets)
+                                                 └── 7. writes CONFIRMED / REJECTED
+                                                                 │
+                                                                 ▼
+                                                           PostgreSQL
+                                                    (events, orders tables —
+                                                     worker is the ONLY writer)
+
+Meanwhile, anytime:
+Client ──GET /orders/{id}──▶ Order API ──read-only lookup──▶ PostgreSQL
+                             (returns PENDING if no row exists yet)
+```
+
+**Request lifecycle**, matching the numbers above:
+1. Client sends `POST /orders` with `event_id`, `user_id`, `quantity`.
+2. Order API generates a UUID `order_id` and immediately returns `202 Accepted` with `{order_id, status: "PENDING"}`.
+3. Order API publishes to `order-requests`, keyed by `event_id` so it's ordered relative to every other request for that event.
+4. Inventory Worker consumes at a pace bounded by its own small, fixed pod count — not by incoming traffic.
+5. Worker checks whether `order_id` was already processed (handles redelivery safely).
+6. Worker atomically decrements `available_tickets` only if it's still > 0.
+7. Worker writes the final `CONFIRMED` or `REJECTED` status.
+
+The API can burst to 20 pods; Postgres only ever sees write traffic from the worker's small, fixed pool. That's the whole trick.
+
+---
+
+## 3. Tech Stack
+
+| Layer | Choice | Why / Alternatives |
+|---|---|---|
+| API framework | FastAPI | Matches your plan; async-native |
+| Kafka client (API) | `aiokafka` | Async producer fits FastAPI's event loop. `confluent-kafka` is the more "industry standard" pick if you'd rather standardize on that |
+| Kafka client (worker) | Same library, used in a plain consume loop | Consistency across both services beats mixing libraries |
+| Message queue | Kafka, KRaft mode (no ZooKeeper) | Simplest modern local setup. Redpanda is a fine drop-in alternative if you want a lighter footprint |
+| Database | PostgreSQL 15+ | As planned |
+| DB access | SQLAlchemy 2.0 async + Alembic because i want an ORM and migrations | `asyncpg` for the API's read path, `psycopg` for the worker's writes |
+| Local orchestration | Docker Compose | For everything before you touch Kubernetes at all |
+| Local Kubernetes | `kind` | Fast, disposable, scriptable. `minikube` is equally fine |
+| Kafka/Postgres on K8s | Helm charts — Bitnami Postgres, Strimzi Kafka Operator | Don't hand-roll StatefulSets for infra you didn't build; spend effort on your two apps and the HPA behavior instead |
+| Load testing | Locust | Python-native, easy to script a ramping spike. k6 is a solid JS-based alternative |
+| Observability | `kube-prometheus-stack` + a Kafka UI (Redpanda Console or Kafdrop) | Produces the graphs that actually prove the DB stayed stable |
+| CI/CD (stretch) | GitHub Actions | You've already built this exact pipeline shape for the Legal Document Analyzer project — reuse it: build/push images, then apply manifests |
+
+---
+
+## 4. Repository Structure
+
+```
+flash-sale-ticketing/
+├── README.md
+├── docker-compose.yml              # Postgres + Kafka (KRaft) + Kafka UI, local dev
+├── .env.example
+│
+├── order-api/                      # App A
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── app/
+│   │   ├── main.py                 # FastAPI entrypoint
+│   │   ├── routers/
+│   │   │   └── orders.py           # POST /orders, GET /orders/{id}
+│   │   ├── schemas.py              # request/response models
+│   │   ├── kafka_producer.py
+│   │   └── db.py                   # read-only connection, status lookups only
+│   └── tests/
+│
+├── inventory-worker/                # App B
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── worker/
+│   │   ├── consumer.py             # Kafka consume loop
+│   │   ├── inventory.py            # idempotency check + atomic decrement
+│   │   └── db.py                   # read/write connection
+│   └── tests/
+│
+├── db/
+│   └── migrations/                 # events, orders table schema
+│
+├── k8s/
+│   ├── base/
+│   │   ├── order-api-deployment.yaml
+│   │   ├── order-api-service.yaml
+│   │   ├── order-api-hpa.yaml
+│   │   ├── inventory-worker-deployment.yaml
+│   │   ├── configmap.yaml
+│   │   └── secrets.yaml
+│   └── infra/                      # Helm values
+│       ├── postgres-values.yaml
+│       └── kafka-values.yaml
+│
+├── load-tests/
+│   └── locustfile.py               # flash-sale spike simulation
+│
+├── monitoring/
+│   └── grafana-dashboard.json      # pods / consumer lag / DB load, overlaid
+│
+└── .github/
+    └── workflows/
+        └── ci-cd.yaml              # (stretch) build, push, deploy
+```
+
+---
+
+## 5. Key Design Decisions
+
+**Idempotency (worker).** Unique constraint on `orders.order_id`. Before decrementing inventory, check whether a row for this `order_id` already exists in a terminal state — if so, it's a redelivered message; skip the work and just commit the Kafka offset. Do the "check + decrement + write" as a single DB transaction, so two redeliveries of the same message can't race each other either.
+
+**Atomic inventory deduction.** One conditional update — decrement `available_tickets` only `WHERE available_tickets > 0`, and check whether a row was actually affected — rather than a separate `SELECT` followed by an `UPDATE`. This conditional update is what actually prevents overselling. Kafka's ordering guarantees are defense in depth on top of it, not a substitute for it.
+
+**Partitioning by `event_id`.** Kafka guarantees same-key messages land in the same partition, and a partition is read by only one consumer in a group at a time — so every request for a given event processes strictly in arrival order, on exactly one worker instance. Different events, different keys, can process in parallel on different partitions. This is *why* you don't need distributed locks anywhere in this system.
+
+**At-least-once + manual offset commits.** Commit Kafka offsets only after the Postgres write succeeds — never on message receipt. A crash between "received" and "wrote" causes a redelivery on restart, which is exactly why the idempotency check exists. Don't chase exactly-once semantics from Kafka configuration; get it from idempotent writes instead — simpler and more robust.
+
+**HPA metric: CPU, on the Order API only.** CPU-based scaling is the right fit for a stateless, request-driven web service, which is what App A is. Don't put HPA on the Inventory Worker — its entire job is running at a small, deliberately fixed pace, and autoscaling it undermines the exact property the project is demonstrating.
+
+**Infra via Helm, apps via hand-written manifests.** Use existing charts/operators for Postgres and Kafka — there's no learning value in hand-rolling a Kafka StatefulSet, and it invites bugs unrelated to what this project is actually about. Write the Deployment/Service/HPA manifests for your own two apps by hand; that's where the learning is.
+
+---
+
+## 6. Build Order
+
+### Phase 0 — Planning & Data Contract
+- [ ] Write out the exact fields on an order request: `event_id`, `user_id`, `quantity`
+- [ ] Sketch the `events` table: `id`, `name`, `total_tickets`, `available_tickets`
+- [ ] Sketch the `orders` table: `order_id` (UUID, unique), `event_id`, `user_id`, `quantity`, `status`, `reason` (nullable), `created_at`, `updated_at`
+- [ ] Lock in tech choices from Section 3 — don't revisit mid-build
+- [ ] Init the repo with the structure from Section 4
+
+### Phase 1 — Local Infra Skeleton
+- [ ] `docker-compose.yml`: Postgres + Kafka (KRaft, single broker) + a Kafka UI
+- [ ] Bring the stack up, manually produce/consume a test message via the UI or CLI
+- [ ] Confirm a Postgres client can connect
+- [ ] No application code yet — prove the plumbing works before building on it
+
+### Phase 2 — Database Layer
+- [ ] Create `events` and `orders` tables
+- [ ] Seed one test event with a small ticket count (e.g. 10 — small numbers make overselling bugs obvious)
+- [ ] Write out the exact shape of the conditional-update statement you'll use for the atomic decrement — get the logic right on paper first
+
+### Phase 3 — App A: Order API (happy path)
+- [ ] FastAPI skeleton + health check
+- [ ] `POST /orders`: validate input, generate `order_id`, publish to `order-requests` keyed by `event_id` — **no DB write**
+- [ ] Return `202` with `{order_id, status: "PENDING"}`
+- [ ] `GET /orders/{order_id}`: read-only lookup; no row found → `PENDING` (not a 404 — the worker just hasn't gotten there yet)
+- [ ] Manually test with curl/Postman; confirm messages land in the Kafka UI
+
+### Phase 4 — App B: Inventory Worker
+- [ ] Kafka consumer skeleton on `order-requests`, manual offset commits
+- [ ] Idempotency check against `orders.order_id`
+- [ ] Atomic conditional decrement of `available_tickets`
+- [ ] Write `CONFIRMED` or `REJECTED` (with `reason: "sold_out"`) to the order row
+- [ ] Commit the offset only after the DB write succeeds
+- [ ] Add an `order-requests-dlq` topic for messages that fail repeatedly, so one bad message can't wedge the consumer
+- [ ] Run both services via Compose; fire manual test orders; watch status transitions
+
+### Phase 5 — Prove Correctness Locally
+- [ ] Set the test event to a small ticket count
+- [ ] Fire more concurrent requests than available tickets (a quick script is fine — doesn't need to be the real load-testing tool yet)
+- [ ] Confirm **exactly** the right number end up `CONFIRMED`, the rest `REJECTED` — zero overselling, zero underselling
+- [ ] Kill the worker mid-run once, restart it, confirm redelivered messages don't double-decrement
+- [ ] Don't move on until this is boring and reliable — everything after this is scaling/ops, not correctness
+
+### Phase 6 — Containerization
+- [ ] Dockerfile for Order API (multi-stage, slim base)
+- [ ] Dockerfile for Inventory Worker
+- [ ] Swap Compose to run the built images; re-run Phase 5's test against them
+
+### Phase 7 — Kubernetes Baseline
+- [ ] Spin up a local cluster (`kind` or `minikube`)
+- [ ] Install Postgres and Kafka via Helm
+- [ ] Write Deployment + Service manifests for both apps; ConfigMap/Secret for connection strings
+- [ ] Deploy, port-forward, re-run Phase 5's correctness test against the in-cluster stack
+
+### Phase 8 — The HPA Flex
+- [ ] Add `resources.requests`/`limits` to the Order API pod spec — HPA needs this to compute utilization
+- [ ] Install `metrics-server` if the cluster doesn't already have it (often missing by default on `kind`/`minikube`)
+- [ ] Write the `HorizontalPodAutoscaler`: `minReplicas: 2`, `maxReplicas: 20`, target CPU ~50–60%
+- [ ] Generate enough load to cross the threshold; watch `kubectl get hpa -w` and `kubectl get pods -w` scale out live
+- [ ] Confirm Postgres connections/CPU stay flat the whole time — this is the actual payoff of the project
+
+### Phase 9 — Observability
+- [ ] Install `kube-prometheus-stack`, or keep it lightweight with `kubectl top pods` + the Kafka UI's consumer-lag view
+- [ ] Build one view with three things overlaid: Order API pod count, Kafka consumer lag, Postgres CPU/connections
+- [ ] Those three lines together are the entire story of the project in one picture
+
+### Phase 10 — Load Testing & Results
+- [ ] Write a Locust scenario ramping from 0 to a few thousand simulated users over a couple of minutes
+- [ ] Run it against the full K8s deployment; capture the Phase 9 dashboard during the run
+- [ ] Write up results (a `RESULTS.md`, or a section at the bottom of this README): pods scaled X→Y, DB stayed under Z% CPU, N orders processed with zero overselling
+- [ ] This writeup is what turns "I built a thing" into "I proved a thing"
+
+---
+
+## 7. Success Criteria
+
+- [ ] Under load exceeding available inventory, exactly the right number of orders are `CONFIRMED` — never more
+- [ ] Every order reaches a terminal state; nothing stays `PENDING` forever
+- [ ] A killed-and-restarted worker never double-processes an order
+- [ ] Postgres CPU/connections stay roughly flat regardless of Order API pod count
+- [ ] HPA visibly scales Order API 2→20 under load and back down after
+- [ ] You have a dashboard or screenshot showing all of the above at once
+
+---
+
+## 8. Stretch Goals
+
+Roughly in order of value for effort:
+
+- [ ] **CI/CD pipeline** — reuse the GitHub Actions pattern from the Legal Document Analyzer project: build/push images on merge, optionally auto-apply K8s manifests
+- [ ] **Deploy to a real cluster (EKS)** — a natural next step since you're already working in AWS for that project's deployment; reuses familiar territory instead of learning a second cloud
+- [ ] **KEDA on the Inventory Worker** — scale worker replicas (up to partition count) based on Kafka consumer lag instead of leaving it fixed; a more "correct" scaling signal for a queue consumer than CPU would be
+- [ ] **Client-provided idempotency keys** — an `Idempotency-Key` header so an accidental double-click doesn't create two separate orders in the first place
+- [ ] **PgBouncer** in front of Postgres — matters more once you're running multiple worker or read replicas
+- [ ] **Auth + per-user rate limiting** on the Order API (JWT + something like 1 request/event/user) to stop trivial bot abuse
+- [ ] **WebSocket or SSE push** instead of status polling
+- [ ] **Minimal frontend** — one page that POSTs an order and shows a spinner → confirmed/sold-out; mostly for demo purposes
+- [ ] **Virtual waiting room** — the pattern real ticketing platforms use, admitting users into the "can even try to buy" pool at a controlled rate. Meaningfully bigger scope — only worth it once the core project is solid

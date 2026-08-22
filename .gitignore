@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Postgres/Kafka Volumes
+pgdata/
+kafkadata/
