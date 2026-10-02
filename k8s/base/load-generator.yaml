@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: flash-sale
+  labels:
+    app: load-generator
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+    spec:
+      containers:
+        - name: load-generator
+          image: python:3.12-slim
+          command:
+            - python
+            - -c
+            - |
+              import json, threading, time, uuid, urllib.request
+
+              URL = 'http://order-api.flash-sale.svc.cluster.local:80/orders'
+              EVENT_ID = 'bf68fd54-09a5-4bd7-aa09-6a6dc98bc25d'
+
+              def worker():
+                  while True:
+                      try:
+                          data = json.dumps({
+                              'event_id': EVENT_ID,
+                              'user_id': str(uuid.uuid4()),
+                              'quantity': 1
+                          }).encode()
+                          req = urllib.request.Request(
+                              URL, data=data,
+                              headers={'Content-Type': 'application/json'})
+                          with urllib.request.urlopen(req, timeout=5) as r:
+                              r.read()
+                      except Exception:
+                          time.sleep(0.05)
+
+              for _ in range(60):
+                  threading.Thread(target=worker, daemon=True).start()
+
+              while True:
+                  time.sleep(3600)
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"

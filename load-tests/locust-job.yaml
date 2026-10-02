@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: locustfile
+  namespace: flash-sale
+data:
+  locustfile.py: |
+    import uuid
+
+    from locust import HttpUser, between, task
+
+    EVENT_ID = "bf68fd54-09a5-4bd7-aa09-6a6dc98bc25d"
+
+
+    class FlashSaleUser(HttpUser):
+        wait_time = between(0.1, 0.3)
+
+        @task
+        def buy_ticket(self):
+            self.client.post(
+                "/orders",
+                json={
+                    "event_id": EVENT_ID,
+                    "user_id": str(uuid.uuid4()),
+                    "quantity": 1,
+                },
+            )
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: locust-spike
+  namespace: flash-sale
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: locust-spike
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: locust
+          image: locustio/locust:latest
+          command:
+            - sh
+            - -c
+            - |
+              locust -f /locust/locustfile.py \
+                --headless --users 1500 --spawn-rate 25 --run-time 5m \
+                --host http://order-api.flash-sale.svc.cluster.local:80 \
+                --csv /results/locust --html /results/report.html \
+                --only-summary
+              echo "=== LOCUST_STATS_CSV ==="
+              cat /results/locust_stats.csv
+              echo "=== END_STATS ==="
+          volumeMounts:
+            - name: locustfile
+              mountPath: /locust
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: locustfile
+          configMap:
+            name: locustfile
+        - name: results
+          emptyDir: {}

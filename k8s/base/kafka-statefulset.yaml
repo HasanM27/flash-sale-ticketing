@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: flash-sale
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: plaintext
+      port: 9092
+      targetPort: 9092
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: flash-sale
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:latest
+          ports:
+            - containerPort: 9092
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka-0.kafka.flash-sale.svc.cluster.local:9092"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@kafka-0.kafka.flash-sale.svc.cluster.local:9093"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topics-init
+  namespace: flash-sale
+  annotations:
+    # re-apply anytime; delete+reapply the job to rerun
+    flash-sale.io/description: creates required topics idempotently
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: kafka-topics-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: topics
+          image: apache/kafka:latest
+          command:
+            - sh
+            - -c
+            - |
+              /opt/kafka/bin/kafka-topics.sh --create --if-not-exists \
+                --topic order-requests --partitions 6 --replication-factor 1 \
+                --bootstrap-server kafka-0.kafka.flash-sale.svc.cluster.local:9092
+              /opt/kafka/bin/kafka-topics.sh --create --if-not-exists \
+                --topic order-requests-dlq --partitions 1 --replication-factor 1 \
+                --bootstrap-server kafka-0.kafka.flash-sale.svc.cluster.local:9092
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-schema-init
+  namespace: flash-sale
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: db-schema-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: schema
+          image: postgres:15-alpine
+          env:
+            - name: PGPASSWORD
+              value: password
+          command:
+            - psql
+            - -h
+            - postgres-postgresql.flash-sale.svc.cluster.local
+            - -U
+            - admin
+            - -d
+            - flash_sale
+            - -c
+            - |
+              DO $$ BEGIN
+                CREATE TYPE orderstatus AS ENUM ('PENDING','CONFIRMED','REJECTED');
+              EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+              CREATE TABLE IF NOT EXISTS events (
+                id UUID PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                total_tickets INTEGER NOT NULL,
+                available_tickets INTEGER NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS orders (
+                order_id UUID PRIMARY KEY,
+                event_id UUID NOT NULL REFERENCES events(id),
+                user_id UUID NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                status orderstatus NOT NULL DEFAULT 'PENDING',
+                reason VARCHAR,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+              );
+              INSERT INTO events VALUES
+                ('bf68fd54-09a5-4bd7-aa09-6a6dc98bc25d','Taylor Swift - VIP Front Row',10,10),
+                ('d4fd8256-cb1c-4986-b7f2-4ad293d25bf3','Test Event - 100 tickets',100,100)
+              ON CONFLICT (id) DO NOTHING;

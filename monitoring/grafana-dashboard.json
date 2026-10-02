@@ -1,0 +1,74 @@
+{
+  "title": "Flash Sale — The Whole Story",
+  "uid": "flash-sale-story",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Order API Pod Count (HPA scale-out)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"flash-sale\", horizontalpodautoscaler=\"order-api-hpa\"}",
+          "legendFormat": "current replicas"
+        },
+        {
+          "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"flash-sale\", horizontalpodautoscaler=\"order-api-hpa\"}",
+          "legendFormat": "desired replicas"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Kafka Consumer Lag (inventory-worker)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"inventory-worker\"})",
+          "legendFormat": "total lag"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Postgres CPU (millicores) — stays flat",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"flash-sale\", pod=~\"postgres-.*\", container!=\"\"}[1m])) * 1000",
+          "legendFormat": "postgres CPU (m)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Order API CPU total (millicores) — spreads across pods",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"flash-sale\", pod=~\"order-api-.*\", container!=\"\"}[1m])) * 1000",
+          "legendFormat": "order-api CPU (m)"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Postgres Connections — only the workers",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(pg_stat_activity_count{datname=\"flash_sale\"})",
+          "legendFormat": "connections"
+        }
+      ]
+    }
+  ]
+}

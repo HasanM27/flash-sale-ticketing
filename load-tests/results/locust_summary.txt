@@ -1,0 +1,21 @@
+[2026-08-23 10:41:04,146] locust-spike-ks9cv/INFO/locust.main: Starting Locust 2.46.3
+[2026-08-23 10:41:04,147] locust-spike-ks9cv/INFO/locust.main: Run time limit set to 300 seconds
+[2026-08-23 10:41:04,148] locust-spike-ks9cv/INFO/locust.runners: Ramping to 1500 users at a rate of 25.00 per second
+[2026-08-23 10:41:24,245] locust-spike-ks9cv/WARNING/root: CPU usage above 90%! This may constrain your throughput and may even give inconsistent response time measurements! See https://docs.locust.io/en/stable/running-distributed.html for how to distribute the load over multiple CPU cores or machines
+[2026-08-23 10:42:11,864] locust-spike-ks9cv/INFO/locust.runners: All users spawned: {"FlashSaleUser": 1500} (1500 total users)
+[2026-08-23 10:46:04,222] locust-spike-ks9cv/INFO/locust.main: --run-time limit reached, shutting down
+[2026-08-23 10:46:15,321] locust-spike-ks9cv/WARNING/locust.runners: CPU usage was too high at some point during the test! See https://docs.locust.io/en/stable/running-distributed.html for how to distribute the load over multiple CPU cores or machines
+[2026-08-23 10:46:15,402] locust-spike-ks9cv/INFO/locust.main: Shutting down (exit code 0)
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders                                                                       197394     0(0.00%) |   1419       1    5071   1500 |  634.48        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                    197394     0(0.00%) |   1419       1    5071   1500 |  634.48        0.00
+
+Response time percentiles (approximated)
+Type     Name                                                                                  50%    66%    75%    80%    90%    95%    98%    99%  99.9% 99.99%   100% # reqs
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+POST     /orders                                                                              1500   1600   1700   1800   2000   2200   2500   2700   3300   4100   5100 197394
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+         Aggregated                                                                           1500   1600   1700   1800   2000   2200   2500   2700   3300   4100   5100 197394
+

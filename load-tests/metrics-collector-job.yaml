@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: metrics-collector
+  namespace: flash-sale
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: metrics-collector
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: collector
+          image: python:3.12-slim
+          command:
+            - python
+            - -c
+            - |
+              import json, time, urllib.parse, urllib.request
+
+              PROM = "http://kps-kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
+
+              def q(expr):
+                  url = PROM + "/api/v1/query?query=" + urllib.parse.quote(expr)
+                  try:
+                      with urllib.request.urlopen(url, timeout=10) as r:
+                          res = json.load(r)["data"]["result"]
+                          return float(res[0]["value"][1]) if res else 0.0
+                  except Exception as e:
+                      print(f"# query error {expr}: {e}", flush=True)
+                      return 0.0
+
+              print("timestamp,hpa_current,hpa_desired,order_api_cpu_m,postgres_cpu_m,kafka_lag,pg_connections", flush=True)
+              for i in range(26):
+                  ts = time.strftime("%H:%M:%S")
+                  row = [
+                      q('kube_horizontalpodautoscaler_status_current_replicas{namespace="flash-sale",horizontalpodautoscaler="order-api-hpa"}'),
+                      q('kube_horizontalpodautoscaler_status_desired_replicas{namespace="flash-sale",horizontalpodautoscaler="order-api-hpa"}'),
+                      q('sum(rate(container_cpu_usage_seconds_total{namespace="flash-sale",pod=~"order-api-.*",container!=""}[1m]))*1000'),
+                      q('sum(rate(container_cpu_usage_seconds_total{namespace="flash-sale",pod=~"postgres-.*",container!=""}[1m]))*1000'),
+                      q('sum(kafka_consumergroup_lag{consumergroup="inventory-worker"})'),
+                      q('sum(pg_stat_activity_count{datname="flash_sale"})'),
+                  ]
+                  print(f"{ts}," + ",".join(str(int(x)) for x in row), flush=True)
+                  if i < 25:
+                      time.sleep(15)
+              print("COLLECTION COMPLETE", flush=True)
