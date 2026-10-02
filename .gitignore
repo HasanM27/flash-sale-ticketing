@@ -10,4 +10,4 @@ __pycache__/
 
 # Postgres/Kafka Volumes
 pgdata/
-kafkadata/
+kafkadata/linux-amd64/
